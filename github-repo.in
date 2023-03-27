@@ -1,0 +1,264 @@
+#!/bin/bash
+
+if [ "$0" == "$BASH_SOURCE" ]; then
+	echo "$0 is not meant to be used as a standalone script, but as a library." 1>&2
+	exit 1
+fi
+
+main() {
+	init "$@"
+
+	if [ -n "$REBUILD" ]; then
+		debug "REBUILD LOCAL REPOSITORY"
+		rebuild_repository $REPOSITORY_DIR $GT_NAME $GT_EMAIL
+	fi
+
+	if [ -n "$UPLOAD" ]; then
+		debug "UPLOAD REPOSITORY TO GITHUB"
+		upload_repository $REPOSITORY_DIR $GH_AUTH_TOKEN $GH_USER_NAME $GH_REPO_NAME $GH_REPO_DEFAULT_BRANCH
+	fi
+}
+
+init() {
+	ERRORS=""
+
+	[ -z "$GT_NAME" ]       && ERRORS+="GT_NAME is not set\n"
+	[ -z "$GT_EMAIL" ]      && ERRORS+="GT_EMAIL is not set\n"
+	[ -z "$GH_AUTH_TOKEN" ] && ERRORS+="GH_AUTH_TOKEN is not set\n"
+	[ -z "$GH_USER_NAME" ]  && ERRORS+="GH_USER_NAME is not set\n"
+	[ -z "$GH_REPO_NAME" ]  && ERRORS+="GH_REPO_NAME is not set\n"
+
+	if [ -n "$ERRORS" ]; then
+		if [ "$VERBOSE" -ge "1" ]; then
+			echo -e "!!! Errors:\n$ERRORS" 1>&2
+		fi
+		exit 1
+	fi
+
+	DESTROY=""
+	REBUILD=""
+	UPLOAD=""
+	VERBOSE="1"
+	REPOSITORY_DIR="_"
+
+	while getopts ":druv:h" OPT; do
+		case $OPT in
+		"d")
+			DESTROY="TRUE"
+			;;
+		"r")
+			REBUILD="TRUE"
+			;;
+		"u")
+			UPLOAD="TRUE"
+			;;
+		"v")
+			case $OPTARG in
+			"0"|"1"|"2")
+				VERBOSE="$OPTARG"
+				;;
+			*)
+				echo "Valid arguments for -$OPT: 0 | 1 | 2" 1>&2
+				exit 1
+				;;
+			esac
+			;;
+		"h")
+			echo "Usage: $0 [OPTIONS]" 1>&2
+			echo "OPTIONS" 1>&2
+			echo "  -d Destroy repository if exists - both local and remote!" 1>&2
+			echo "  -r Rebuild local repository" 1>&2
+			echo "  -u Upload local repository to GitHub" 1>&2
+			echo "  -v Output information level" 1>&2
+			echo "EXAMPLE" 1>&2
+			echo "$0 -r -u" 1>&2
+			exit 1
+			;;
+		":")
+			echo "Option -$OPTARG requires an argument" 1>&2
+			exit 1
+			;;
+		"?")
+			echo "Invalid option: -$OPTARG" 1>&2
+			exit 1
+			;;
+		esac
+	done
+
+	if [ "$#" -eq "0" ]; then
+		$0 -h
+		exit 1
+	fi
+}
+
+trace() {
+	if [ "$VERBOSE" -ge "2" ]; then
+		echo "~~~ $1"
+	fi
+}
+
+debug() {
+	if [ "$VERBOSE" -ge "1" ]; then
+		echo "--- $1"
+	fi
+}
+
+audit() {
+	if [ "$VERBOSE" -ge "0" ]; then
+		echo "--- $1"
+	fi
+}
+
+error() {
+	if [ "$VERBOSE" -ge "0" ]; then
+		echo "!!! $1" 1>&2
+	fi
+}
+
+rebuild_repository() {
+	local REPO_DIR="$1"; local GT_NAME="$2"; local GT_EMAIL="$3";
+
+	REPO_EXIST=$(test -d "$REPO_DIR"; echo "$?")
+
+	## 1
+	## We have a destroy command AND the repository exists.
+	if [ -n "$DESTROY" ] && [ "$REPO_EXIST" -eq "0" ]; then
+		debug "Deleting existing local repository"
+		rm -rf "$REPO_DIR"
+	fi
+
+	## 2
+	## We have a destroy command - thus the repository was deleted if existed at [1]
+	## OR the repository does not exist at all - so it is created
+	if [ -n "$DESTROY" ] || [ "$REPO_EXIST" -ge "1" ]; then
+		debug "Creting new local repository"
+
+		mkdir "$REPO_DIR" && cd "$REPO_DIR"
+		git-repo.sh -ic -n "$GT_NAME" -e "$GT_EMAIL"
+
+		touch .gitignore
+		git add .
+		git commit -m "Initial commit"
+
+		cd ..
+	else
+		## Delete local tags and branches
+		cd "$REPO_DIR"
+
+		git checkout master
+
+		local TGS="git tag"
+		local BRS="git branch | grep -v 'master'"
+
+		if [ $(eval "$TGS | wc -l") -ne "0" ]; then
+			debug "Deleting local tags"
+			eval "$TGS | xargs git tag -d"
+		fi
+
+		if [ $(eval "$BRS | wc -l") -ne "0" ]; then
+			debug "Deleting local branches"
+			eval "$BRS | xargs git branch -D"
+		fi
+
+		git gc --aggressive --prune=now
+
+		cd ..
+	fi
+
+	cd "$REPO_DIR"
+	build_repository
+	cd ..
+}
+
+build_repository() {
+	return 0
+}
+
+upload_repository() {
+	local REPO_DIR="$1"; local AUTH_TOKEN="$2"; local USER_NAME="$3"; local REPO_NAME="$4";  local REPO_DEFAULT_BRANCH="$5"; 
+
+	if [ ! -d "$REPO_DIR/.git" ]; then
+		error "Cannot upload repository. It does not exist."
+		exit 1
+	fi
+
+	cd "$REPO_DIR"
+
+	debug "Checking existing repository in GitHub"
+	local EXISTS_RES=$(curl -X GET -sSL -o /dev/null -w '%{http_code}\n' \
+	-H "Authorization: token $AUTH_TOKEN" \
+	"https://api.github.com/repos/$USER_NAME/$REPO_NAME")
+
+	## 1
+	## We have a destroy command AND the repository exists.
+	if [ -n "$DESTROY" ] && [ "$EXISTS_RES" -eq "200" ]; then
+		debug "Deleting existing repository in GitHub"
+		local DELETE_RES=$(curl -X DELETE -sSL -o /dev/null -w '%{http_code}\n' \
+		-H "Authorization: token $AUTH_TOKEN" \
+		"https://api.github.com/repos/$USER_NAME/$REPO_NAME")
+
+		if [ "$DELETE_RES" -ge "400" ]; then
+			error "Failed to delete existing repository in GitHub"
+			exit 1
+		fi
+	fi
+
+	## 2
+	## We have a destroy command - thus the repository was deleted if existed at [1]
+	## OR the repository does not exist at all - so it is created
+	if [ -n "$DESTROY" ] || [ "$EXISTS_RES" -ge "400" ]; then
+		debug "Creating new repository in GitHub"
+		local CREATE_RES=$(curl -X POST -sSL -o /dev/null -w '%{http_code}\n' \
+		-H "Authorization: token $AUTH_TOKEN" \
+		-d "{\"name\":\"$REPO_NAME\"}" \
+		"https://api.github.com/user/repos")
+
+		if [ "$CREATE_RES" -ge "400" ]; then
+			error "Failed to create new repository in GitHub"
+			exit 1
+		fi
+
+		debug "Adding remote repository as origin"
+		git remote add origin "https://$AUTH_TOKEN@github.com/$USER_NAME/$REPO_NAME.git"
+	else
+		## Delete remote tags and branches
+		local TGS="git ls-remote -t origin | grep -v '{}' | cut -f 2 | cut -d '/' -f 3"
+		local BRS="git ls-remote -h origin | grep -v 'master' | cut -f 2 | cut -d '/' -f 3"
+
+		if [ $(eval "$TGS | wc -l") -ne "0" ]; then
+			debug "Deleting remote tags"
+			eval "$TGS | xargs git push -d origin"
+		fi
+
+		if [ $(eval "$BRS | wc -l") -ne "0" ]; then
+			debug "Deleting remote branches"
+			eval "$BRS | xargs git push -d origin"
+		fi
+
+		git gc --aggressive --prune=now
+	fi
+
+	debug "Pushing branches to origin"
+	git push -u --all origin
+
+	debug "Pushing tags to origin"
+	git push --tags origin
+
+	## We have a destroy command - thus the repository was deleted if existed at [1]
+	## OR the repository does not exist at all - so it was created at [2]
+	## AND we also have a definition of a default branch
+	if [ -n "$DESTROY" ] || [ "$EXISTS_RES" -ge "400" ] && [ -n "$REPO_DEFAULT_BRANCH" ]; then
+		debug "Updating default branch in new repository in GitHub"
+		local UPDATE_RES=$(curl -X PATCH -sSL -o /dev/null -w '%{http_code}\n' \
+		-H "Authorization: token $AUTH_TOKEN" \
+		-d "{\"default_branch\":\"$REPO_DEFAULT_BRANCH\"}" \
+		"https://api.github.com/repos/$USER_NAME/$REPO_NAME")
+
+		if [ "$UPDATE_RES" -ge "400" ]; then
+			error "Failed to update default branch in new repository in GitHub"
+			exit 1
+		fi
+	fi
+
+	cd ..
+}
