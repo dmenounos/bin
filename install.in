@@ -1,0 +1,274 @@
+#!/bin/bash
+
+if [ "$0" == "$BASH_SOURCE" ]; then
+	echo "$0 is not meant to be used as a standalone script, but as a library." 1>&2
+	exit 1
+fi
+
+main() {
+	init "$@"
+
+	download_archive "$ARCHURL" "$ARCHIVE"
+
+	confirm_install "$DEST" "$HOMEDIR"
+
+	deploy_archive "$DEST" "$ARCHIVE" "$ARCHDIR" "$HOMEDIR" "$HOMELNK"
+
+	set_ownership "$DEST" "$HOMEDIR"
+
+	set_permissions "$DEST" "$HOMEDIR"
+
+	add_environment_variable "$DEST" "$HOMELNK" "$HOMEVAR" "$HOMEBIN"
+}
+
+init() {
+	ERRORS=""
+
+	[ -z "$ARCHIVE" ] && ERRORS+="ARCHIVE is not set\n"
+	[ -z "$ARCHDIR" ] && ERRORS+="ARCHDIR is not set\n"
+	[ -z "$HOMEDIR" ] && ERRORS+="HOMEDIR is not set\n"
+	[ -z "$HOMELNK" ] && ERRORS+="HOMELNK is not set\n"
+
+	if [ -n "$ERRORS" ]; then
+		if [ "$VERBOSE" -ge "1" ]; then
+			echo -e "!!! Errors:\n$ERRORS" 1>&2
+		fi
+		exit 1
+	fi
+
+	USER=$(whoami)
+	DEST=""
+	CONFIRM=""
+	VERBOSE="1"
+
+	while getopts ":d:yv:h" OPT; do
+		case $OPT in
+		"d")
+			DEST=${OPTARG%/}
+			;;
+		"y")
+			CONFIRM="y"
+			;;
+		"v")
+			case $OPTARG in
+			"0"|"1"|"2")
+				VERBOSE="$OPTARG"
+				;;
+			*)
+				echo "Valid arguments for -$OPT: 0 | 1 | 2" 1>&2
+				exit 1
+				;;
+			esac
+			;;
+		"h")
+			echo "Usage: $0 [OPTIONS]" 1>&2
+			echo "OPTIONS" 1>&2
+			echo "  -d Destination path" 1>&2
+			echo "  -y Do not ask confirmation" 1>&2
+			echo "  -v Output information level" 1>&2
+			echo "EXAMPLE" 1>&2
+			echo "$0 -d /$HOME/Programs" 1>&2
+			echo "$0 -d /opt" 1>&2
+			exit 1
+			;;
+		":")
+			echo "Option -$OPTARG requires an argument" 1>&2
+			exit 1
+			;;
+		"?")
+			echo "Invalid option: -$OPTARG" 1>&2
+			exit 1
+			;;
+		esac
+	done
+
+	if [ -z "$DEST" ]; then
+		if [ $USER != "root" ]; then
+			DEST="$HOME/Programs"
+		else
+			DEST="/opt"
+		fi
+	fi
+
+	EXTRACT_DIR="$DEST/$ARCHDIR"
+	INSTALL_DIR="$DEST/$HOMEDIR"
+	INSTALL_LNK="$DEST/$HOMELNK"
+}
+
+trace() {
+	if [ "$VERBOSE" -ge "2" ]; then
+		echo "~~~ $1"
+	fi
+}
+
+debug() {
+	if [ "$VERBOSE" -ge "1" ]; then
+		echo "--- $1"
+	fi
+}
+
+audit() {
+	if [ "$VERBOSE" -ge "0" ]; then
+		echo "--- $1"
+	fi
+}
+
+error() {
+	if [ "$VERBOSE" -ge "0" ]; then
+		echo "!!! $1" 1>&2
+	fi
+}
+
+#
+# Downloads the archive if it does not exists already.
+# In addition, validates the integrity of the archive, if a hash file is present. 
+# Note however, the hash file is not downloaded but it has to be provided manually.
+#
+download_archive() {
+	local ARCHURL="$1"; local ARCHIVE="$2"; 
+	trace "download_archive: ARCHURL=$ARCHURL ARCHIVE=$ARCHIVE"
+
+	if [ -z "$ARCHURL" ]; then
+		debug "Skiping download_archive, ARCHURL is not set"
+		return
+	fi
+
+	if [ ! -f "$ARCHIVE" ]; then
+		curl -L -o "$ARCHIVE" "$ARCHURL"
+	fi
+
+	# Check hash - if exists. Resolve file manualy for now.
+	if [ -f "$ARCHIVE.sha256" ]; then
+		sha256sum -c "$ARCHIVE.sha256"
+	fi
+
+	# Check hash - if exists. Resolve file manualy for now.
+	if [ -f "$ARCHIVE.sha512" ]; then
+		sha512sum -c "$ARCHIVE.sha512"
+	fi
+}
+
+#
+# Asks the user to confirm the installation path.
+# Validates that the root path exists and the full path can be created.
+#
+confirm_install() {
+	local DEST="$1"; local HOMEDIR="$2"; 
+	trace "confirm_install: DEST=$DEST HOMEDIR=$HOMEDIR"
+
+	if [ "$CONFIRM" == "y" ]; then
+		return
+	fi
+
+	echo -n "Install into directory $DEST/$HOMEDIR (y/n) "
+	read CONFIRM
+
+	if [ "$CONFIRM" != "y" ]; then
+		exit 1
+	fi
+
+	if [ ! -d "$DEST" ]; then
+		error "Directory $DEST does not exists. Operation aborted."
+		exit 1
+	fi
+
+	if [ -d "$DEST/$HOMEDIR" ]; then
+		error "Directory $DEST/$HOMEDIR already exists. Operation aborted."
+		exit 1
+	fi
+}
+
+#
+# Extracts the archive to the root path.
+# Supported formats are: tat.gz, tar.bz2, tar.xz, zip.
+#
+extract_archive() {
+	local DEST="$1"; local ARCHIVE="$2"; 
+	trace "extract_archive: DEST=$DEST ARCHIVE=$ARCHIVE"
+
+	mkdir -p $DEST
+
+	if [[ "$ARCHIVE" == *.tar.gz ]] || [[ "$ARCHIVE" == *.tgz ]]; then
+		tar xzf $ARCHIVE -C $DEST
+	elif [[ "$ARCHIVE" == *.tar.bz2 ]]; then
+		tar xjf $ARCHIVE -C $DEST
+	elif [[ "$ARCHIVE" == *.tar.xz ]]; then
+		tar xJf $ARCHIVE -C $DEST
+	elif [[ "$ARCHIVE" == *.zip ]]; then
+		unzip $ARCHIVE -d $DEST
+	else
+		error "Did not extract $ARCHIVE"
+		exit 1
+	fi
+}
+
+#
+# Extracts the archive to the appropriate path.
+#
+deploy_archive() {
+	local DEST="$1"; local ARCHIVE="$2"; local ARCHDIR="$3"; local HOMEDIR="$4"; local HOMELNK="$5"; 
+	trace "deploy_archive: DEST=$DEST ARCHIVE=$ARCHIVE ARCHDIR=$ARCHDIR HOMEDIR=$HOMEDIR HOMELNK=$HOMELNK"
+
+	extract_archive $DEST $ARCHIVE
+
+	local EXTRACT_DIR="$DEST/$ARCHDIR"
+	local INSTALL_DIR="$DEST/$HOMEDIR"
+	local INSTALL_LNK="$DEST/$HOMELNK"
+
+	if [ "$EXTRACT_DIR" != "$INSTALL_DIR" ]; then
+		mv $EXTRACT_DIR $INSTALL_DIR
+	fi
+
+	if [ "$INSTALL_DIR" != "$INSTALL_LNK" ]; then
+		ln -sf $HOMEDIR $INSTALL_LNK
+	fi
+}
+
+#
+# Takes ownership of everything.
+#
+set_ownership() {
+	local DEST="$1"; local HOMEDIR="$2"; 
+	trace "set_ownership: DEST=$DEST HOMEDIR=$HOMEDIR"
+
+	local INSTALL_DIR="$DEST/$HOMEDIR"
+
+	chown -R $USER:$USER $INSTALL_DIR
+}
+
+#
+# Applies default access permissions.
+#
+set_permissions() {
+	local DEST="$1"; local HOMEDIR="$2"; 
+	trace "set_permissions: DEST=$DEST HOMEDIR=$HOMEDIR"
+
+	local INSTALL_DIR="$DEST/$HOMEDIR"
+
+	find $INSTALL_DIR -type d -print0 | xargs -0 chmod 775 
+	find $INSTALL_DIR -type f -print0 | xargs -0 chmod ug+r 
+}
+
+#
+# Adds environment vaiable to session script.
+#
+add_environment_variable() {
+	local DEST="$1"; local HOMELNK="$2"; local HOMEVAR="$3"; local HOMEBIN="$4"; 
+	trace "add_environment_variable: DEST=$DEST HOMELNK=$HOMELNK HOMEVAR=$HOMEVAR HOMEBIN=$HOMEBIN"
+
+	if [ -z "$HOMEVAR" ]; then
+		debug "Skiping add_environment_variable, HOMEVAR is not set"
+		return
+	fi
+
+	local INSTALL_LNK="$DEST/$HOMELNK"
+
+	[ $USER != "root" ] \
+		&& local SCRIPT="$HOME/.bashrc" \
+		|| local SCRIPT="/etc/profile.d/${HOMEVAR,,}.sh"
+
+	echo ""                                          >> $SCRIPT
+	echo "# $HOMEVAR #"                              >> $SCRIPT
+	echo "export $HOMEVAR=\"$INSTALL_LNK\""          >> $SCRIPT
+	echo "export PATH=\"\$$HOMEVAR$HOMEBIN:\$PATH\"" >> $SCRIPT
+}

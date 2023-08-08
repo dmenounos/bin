@@ -1,0 +1,78 @@
+#!/bin/bash
+
+if [ "$0" == "$BASH_SOURCE" ]; then
+	echo "$0 is not meant to be used as a standalone script, but as a library." 1>&2
+	exit 1
+fi
+
+require_admin() {
+	USER=`whoami`
+
+	if [ ! $USER = "root" ]; then
+		echo "Usage: $0 must be run as root"
+		exit 1
+	fi
+}
+
+is_package_installed() {
+
+	# --show       list all packages matching the given pattern
+	# --showformat specify the output format
+	# 2>/dev/null  discard stderr
+	# &>/dev/null  discard stderr and stdout
+
+	dpkg-query --show --showformat="\${status}\n" $1 2>/dev/null | grep "install ok installed" &>/dev/null
+	echo "$?"
+}
+
+install_packages() {
+
+	echo "Checking for packages to install"
+	MISSING=""
+
+	for i in "$@"; do
+		if [ $(is_package_installed "$i") -ne "0" ]; then
+			MISSING+="$i "
+		fi
+	done
+
+	if [ -n "$MISSING" ]; then
+		echo "Found packages to install: $MISSING"
+		echo -n "Install packages (y/n) "
+		read CONFIRM
+
+		if [ ! $CONFIRM = "y" ]; then 
+			exit 0
+		fi
+
+		apt install $MISSING
+	else
+		echo "Found no packages to install"
+	fi
+}
+
+purge_packages() {
+
+	echo "Checking for packages to remove"
+	PURGING=""
+
+	for i in "$@"; do
+		if [ $(is_package_installed "$i") -eq "0" ]; then
+			PURGING+="$i "
+		fi
+	done
+
+	if [ -n "$PURGING" ]; then
+		echo "Found packages to remove: $PURGING"
+		echo -n "Remove packages (y/n) "
+		read CONFIRM
+
+		if [ ! $CONFIRM = "y" ]; then 
+			exit 0
+		fi
+
+		apt purge $PURGING
+	else
+		echo "Found no packages to remove"
+	fi
+}
